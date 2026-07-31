@@ -275,3 +275,92 @@ func TestAnyWithNoTasks(t *testing.T) {
 		t.Fatalf("want zero value and ErrNoTasks, got (%q, %v)", value, err)
 	}
 }
+
+// waitForCtx — задача, честно уважающая контекст: висит до отмены и возвращает
+// её причину. На уже отменённом контексте завершается сразу.
+func waitForCtx(ctx context.Context) (string, error) {
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func TestAllSettledWithCancelledContext(t *testing.T) {
+	base := runtime.NumGoroutine()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	got := AllSettled(ctx, waitForCtx, waitForCtx)
+	if len(got) != 2 {
+		t.Fatalf("want 2 results, got %#v", got)
+	}
+	for i, r := range got {
+		if !errors.Is(r.Err, context.Canceled) {
+			t.Errorf("result %d: want context.Canceled, got %v", i, r.Err)
+		}
+	}
+	waitNoExtraGoroutines(t, base)
+}
+
+func TestAllWithCancelledContext(t *testing.T) {
+	base := runtime.NumGoroutine()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	values, err := All(ctx, waitForCtx, waitForCtx)
+	if values != nil {
+		t.Fatalf("want nil values, got %q", values)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want wrapped context.Canceled, got %v", err)
+	}
+	waitNoExtraGoroutines(t, base)
+}
+
+func TestRaceWithCancelledContext(t *testing.T) {
+	base := runtime.NumGoroutine()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	value, err := Race(ctx, waitForCtx)
+	if value != "" || !errors.Is(err, context.Canceled) {
+		t.Fatalf("want zero value and context.Canceled, got (%q, %v)", value, err)
+	}
+	waitNoExtraGoroutines(t, base)
+}
+
+func TestAnyWithCancelledContext(t *testing.T) {
+	base := runtime.NumGoroutine()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	value, err := Any(ctx, waitForCtx, waitForCtx)
+	if value != "" {
+		t.Fatalf("want zero value, got %q", value)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want joined context.Canceled, got %v", err)
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok || len(joined.Unwrap()) != 2 {
+		t.Fatalf("want 2 joined errors, got %v", err)
+	}
+	waitNoExtraGoroutines(t, base)
+}
+
+func TestAnyPreservesPanicError(t *testing.T) {
+	base := runtime.NumGoroutine()
+	errPlain := errors.New("plain failure")
+
+	_, err := Any(context.Background(),
+		func(context.Context) (string, error) { panic("boom") },
+		func(context.Context) (string, error) { return "", errPlain },
+	)
+
+	var panicErr *PanicError
+	if !errors.As(err, &panicErr) || panicErr.Value != "boom" {
+		t.Fatalf("want wrapped PanicError(boom), got %v", err)
+	}
+	if !errors.Is(err, errPlain) {
+		t.Fatalf("joined error does not contain plain failure: %v", err)
+	}
+	waitNoExtraGoroutines(t, base)
+}
