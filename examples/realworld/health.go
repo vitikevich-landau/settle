@@ -111,8 +111,10 @@ func demoHealth() {
 // зависшая проба переживёт сам ответ. В настоящем коде здесь были бы
 // db.PingContext, redis-клиент с ctx или HEAD-запрос с NewRequestWithContext.
 //
-// При ошибке проба возвращает нулевой probe: это контракт settle — если
-// Err != nil, в Value смотреть не нужно.
+// При ошибке проба возвращает нулевой probe — по общему соглашению Go.
+// Stream ничего не занулит за вас: в Result.Value приедет ровно то, что
+// вернула задача, поэтому «значение осмысленно только при Err == nil» —
+// договорённость между автором задачи и её потребителем.
 func pingDependency(d dependency) func(context.Context) (probe, error) {
 	return func(ctx context.Context) (probe, error) {
 		start := time.Now()
