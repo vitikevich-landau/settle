@@ -24,9 +24,8 @@ func sleepTask(d time.Duration, v string, err error) func(context.Context) (stri
 }
 
 // hangTask собирает задачу-«вечного работника»: она висит до отмены контекста
-// и возвращает ошибку отмены. На таких задачах видно главное свойство Stream:
-// break из цикла действительно отменяет проигравших — и заодно вывод примеров
-// не зависит от таймингов.
+// и возвращает ошибку отмены. На ней видно, что комбинаторы действительно
+// отменяют проигравших и дожидаются их завершения.
 func hangTask() func(context.Context) (string, error) {
 	return func(ctx context.Context) (string, error) {
 		<-ctx.Done()
@@ -34,8 +33,9 @@ func hangTask() func(context.Context) (string, error) {
 	}
 }
 
-// Promise.allSettled: дождаться всех, собрать всё.
-func ExampleStream_allSettled() {
+// AllSettled дожидается всех задач и возвращает каждый исход в порядке
+// исходного списка.
+func ExampleAllSettled() {
 	ctx := context.Background()
 	tasks := []func(context.Context) (string, error){
 		sleepTask(60*time.Millisecond, "first", nil),
@@ -43,14 +43,7 @@ func ExampleStream_allSettled() {
 		sleepTask(30*time.Millisecond, "third", nil),
 	}
 
-	// Результаты приходят в порядке завершения; индекс расставляет их по
-	// местам — в срез размером с исходный список задач.
-	results := make([]settle.Result[string], len(tasks))
-	for i, r := range settle.Stream(ctx, tasks...) {
-		results[i] = r
-	}
-
-	for i, r := range results {
+	for i, r := range settle.AllSettled(ctx, tasks...) {
 		if r.Err != nil {
 			fmt.Printf("#%d failed: %v\n", i, r.Err)
 		} else {
@@ -63,61 +56,102 @@ func ExampleStream_allSettled() {
 	// #2: third
 }
 
-// Promise.all: первая ошибка прерывает цикл, а break отменяет остальных.
-func ExampleStream_all() {
+// All возвращает значения, только если успешны все задачи. Первая ошибка
+// отменяет остальных; при ошибке частичного среза нет.
+func ExampleAll() {
 	ctx := context.Background()
 	tasks := []func(context.Context) (string, error){
 		func(ctx context.Context) (string, error) { return "fine", nil },
-		hangTask(), // работала бы вечно — но break её отменит
+		hangTask(), // работала бы вечно — но All её отменит
 		func(ctx context.Context) (string, error) { return "", errors.New("broken") },
 	}
 
-	out := make([]string, len(tasks))
-	var firstErr error
-	for i, r := range settle.Stream(ctx, tasks...) {
-		if r.Err != nil {
-			firstErr = r.Err
-			break // отменяет зависшую задачу
-		}
-		out[i] = r.Value
-	}
-
-	fmt.Println("error:", firstErr)
+	values, err := settle.All(ctx, tasks...)
+	fmt.Println("values:", values)
+	fmt.Println("error:", err)
 	// Output:
-	// error: broken
+	// values: []
+	// error: settle: task 2: broken
 }
 
-// Promise.race: взять первую завершившуюся задачу, остальных отменить.
-func ExampleStream_race() {
+// Race возвращает первый завершившийся исход — успех или ошибку — и отменяет
+// проигравших.
+func ExampleRace() {
 	ctx := context.Background()
 	tasks := []func(context.Context) (string, error){
-		hangTask(), // проигравший: сам не завершится, его отменит break
+		hangTask(),
 		func(ctx context.Context) (string, error) { return "quick", nil },
 	}
 
-	for _, r := range settle.Stream(ctx, tasks...) {
-		fmt.Println("winner:", r.Value)
-		break
-	}
+	value, err := settle.Race(ctx, tasks...)
+	fmt.Println("winner:", value, err)
 	// Output:
-	// winner: quick
+	// winner: quick <nil>
 }
 
-// Promise.any: побеждает первый успех, ошибки пропускаются.
-func ExampleStream_any() {
+// Any пропускает ошибки и возвращает первый успех. Если успехов нет, в ошибке
+// лежит errors.Join всех неудач.
+func ExampleAny() {
 	ctx := context.Background()
 	tasks := []func(context.Context) (string, error){
 		func(ctx context.Context) (string, error) { return "", errors.New("fast but broken") },
 		func(ctx context.Context) (string, error) { return "alive", nil },
-		hangTask(), // так и не финиширует сам — будет отменён при break
+		hangTask(),
 	}
 
-	for _, r := range settle.Stream(ctx, tasks...) {
-		if r.Err == nil {
-			fmt.Println("first success:", r.Value)
-			break
+	value, err := settle.Any(ctx, tasks...)
+	fmt.Println("first success:", value, err)
+	// Output:
+	// first success: alive <nil>
+}
+
+// Stream нужен для своей политики: здесь ошибка необязательной задачи
+// допустима, ошибка обязательной останавливает обработку, а индекс связывает
+// результат с этой политикой.
+func ExampleStream() {
+	ctx := context.Background()
+	afterOptional := make(chan struct{})
+	afterProfile := make(chan struct{})
+	names := []string{"profile", "recommendations", "orders", "audit"}
+	required := []bool{true, false, true, false}
+	tasks := []func(context.Context) (string, error){
+		func(context.Context) (string, error) {
+			<-afterOptional
+			return "Ivan", nil
+		},
+		func(context.Context) (string, error) {
+			return "", errors.New("unavailable")
+		},
+		func(context.Context) (string, error) {
+			<-afterProfile
+			return "", errors.New("forbidden")
+		},
+		hangTask(),
+	}
+
+loop:
+	for i, result := range settle.Stream(ctx, tasks...) {
+		switch {
+		case result.Err == nil:
+			fmt.Printf("%s: %s\n", names[i], result.Value)
+		case required[i]:
+			fmt.Printf("%s: fatal: %v\n", names[i], result.Err)
+			break loop
+		default:
+			fmt.Printf("%s: skipped: %v\n", names[i], result.Err)
+		}
+
+		// Каналы делают порядок примера детерминированным без time.Sleep:
+		// после необязательной ошибки разрешаем профиль, затем заказы.
+		switch i {
+		case 1:
+			close(afterOptional)
+		case 0:
+			close(afterProfile)
 		}
 	}
 	// Output:
-	// first success: alive
+	// recommendations: skipped: unavailable
+	// profile: Ivan
+	// orders: fatal: forbidden
 }

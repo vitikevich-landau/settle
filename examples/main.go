@@ -4,9 +4,9 @@
 //
 //	go run ./examples
 //
-// Каждая demo-функция ниже — отдельный сценарий использования, от простого к
-// сложному: allSettled, all, race, any, таймаут через контекст и перехват
-// паник. Читать лучше сверху вниз — сценарии ссылаются на идеи предыдущих.
+// Каждая demo-функция ниже — отдельный сценарий использования: готовые
+// комбинаторы AllSettled, All, Race и Any, затем низкоуровневый Stream,
+// общий дедлайн и перехват паник.
 //
 // Задачи здесь намеренно синтетические: они просто спят, чтобы был виден сам
 // механизм. Те же приёмы на работе, похожей на боевую — HTTP-запросы к
@@ -28,6 +28,7 @@ func main() {
 	demoAll()
 	demoRace()
 	demoAny()
+	demoStream()
 	demoTimeout()
 	demoPanic()
 }
@@ -54,10 +55,10 @@ func job(name string, d time.Duration, value string, err error) func(context.Con
 	}
 }
 
-// Сценарий 1. Promise.allSettled: дождаться ВСЕХ задач и собрать все исходы —
-// и успехи, и ошибки. Самый частый способ использования settle.
+// Сценарий 1. AllSettled: дождаться ВСЕХ задач и собрать все исходы — и
+// успехи, и ошибки. Самый частый способ использования settle.
 func demoAllSettled() {
-	section("allSettled: собрать все результаты")
+	section("AllSettled: собрать все результаты")
 
 	tasks := []func(context.Context) (string, error){
 		job("медленный", 60*time.Millisecond, "данные из БД", nil),
@@ -65,16 +66,10 @@ func demoAllSettled() {
 		job("средний", 30*time.Millisecond, "данные из кеша", nil),
 	}
 
-	// Результаты приходят в порядке ЗАВЕРШЕНИЯ (сломанный, средний,
-	// медленный), а не в порядке объявления. Индекс i говорит, чья это
-	// работа, — кладём результат в срез на его законное место.
-	results := make([]settle.Result[string], len(tasks))
-	for i, r := range settle.Stream(context.Background(), tasks...) {
-		fmt.Printf("  завершилась задача #%d\n", i)
-		results[i] = r
-	}
-
-	// Теперь results упорядочен как исходный список задач.
+	// Внутри результаты приезжают по готовности, но AllSettled сам
+	// раскладывает их по индексам. Возвращённый срез всегда совпадает по
+	// порядку и длине с tasks.
+	results := settle.AllSettled(context.Background(), tasks...)
 	for i, r := range results {
 		if r.Err != nil {
 			fmt.Printf("  #%d: ошибка: %v\n", i, r.Err)
@@ -84,11 +79,11 @@ func demoAllSettled() {
 	}
 }
 
-// Сценарий 2. Promise.all: нужны ВСЕ результаты, но первая же ошибка делает
-// остальные бессмысленными. break отменяет всё, что ещё работает, — этого
-// JS-овский Promise.all не умеет: там проигравшие продолжают крутиться.
+// Сценарий 2. All: нужны ВСЕ результаты, но первая же ошибка делает остальные
+// бессмысленными. Комбинатор отменяет всё, что ещё работает, — этого
+// JS-овский Promise.all сам по себе не умеет.
 func demoAll() {
-	section("all: первая ошибка отменяет остальных")
+	section("All: первая ошибка отменяет остальных")
 
 	tasks := []func(context.Context) (string, error){
 		job("быстрый", 10*time.Millisecond, "готово", nil),
@@ -96,28 +91,21 @@ func demoAll() {
 		job("вечный", 10*time.Second, "этого никто не увидит", nil),
 	}
 
-	out := make([]string, len(tasks))
-	var firstErr error
-	for i, r := range settle.Stream(context.Background(), tasks...) {
-		if r.Err != nil {
-			firstErr = r.Err
-			// break отменяет контекст «вечной» задачи и ЖДЁТ её выхода:
-			// строка «[вечный] отменена» печатается ещё до выхода из цикла.
-			break
-		}
-		out[i] = r.Value
+	// При ошибке All возвращает nil вместо случайного набора успевших
+	// значений. Перед возвратом он отменяет «вечную» задачу и ждёт её выхода:
+	// строка «[вечный] отменена» печатается раньше строки ниже.
+	values, err := settle.All(context.Background(), tasks...)
+	if err != nil {
+		fmt.Printf("  сбор прерван: %v (результаты: %v)\n", err, values)
+		return
 	}
-
-	if firstErr != nil {
-		fmt.Printf("  сбор прерван: %v (частичные результаты: %q)\n", firstErr, out)
-	}
+	fmt.Printf("  всё готово: %q\n", values)
 }
 
-// Сценарий 3. Promise.race: несколько равнозначных источников, берём самый
-// быстрый ответ — неважно, успех это или ошибка. Классика: запрос к
-// нескольким зеркалам, кто первый — того и тапки.
+// Сценарий 3. Race: несколько равнозначных источников, берём самый быстрый
+// ответ — неважно, успех это или ошибка.
 func demoRace() {
-	section("race: побеждает самый быстрый")
+	section("Race: побеждает самый быстрый")
 
 	tasks := []func(context.Context) (string, error){
 		job("зеркало-EU", 80*time.Millisecond, "ответ из Европы", nil),
@@ -125,19 +113,20 @@ func demoRace() {
 		job("зеркало-ASIA", 120*time.Millisecond, "ответ из Азии", nil),
 	}
 
-	// Берём первую же пару и сразу выходим: break отменит оба проигравших
-	// зеркала — их «отменена»-строки появятся до того, как мы пойдём дальше.
-	for i, r := range settle.Stream(context.Background(), tasks...) {
-		fmt.Printf("  победило зеркало #%d: %s\n", i, r.Value)
-		break
+	// Здесь важно само значение, а не индекс зеркала, поэтому готовая
+	// обёртка проще Stream. Проигравших Race отменит и дождётся сам.
+	value, err := settle.Race(context.Background(), tasks...)
+	if err != nil {
+		fmt.Printf("  первой пришла ошибка: %v\n", err)
+		return
 	}
+	fmt.Printf("  самый быстрый ответ: %s\n", value)
 }
 
-// Сценарий 4. Promise.any: как race, но ошибки не считаются победой — ждём
-// первый УСПЕХ, а неудачников просто пропускаем. Если бы успехов не
-// нашлось вовсе, цикл дошёл бы до конца и firstOK остался бы пустым.
+// Сценарий 4. Any: как Race, но ошибки не считаются победой — ждём первый
+// УСПЕХ. Если упадут все, Any вернёт errors.Join их ошибок.
 func demoAny() {
-	section("any: первый успех, ошибки пропускаем")
+	section("Any: первый успех, ошибки пропускаем")
 
 	tasks := []func(context.Context) (string, error){
 		job("резерв-1", 10*time.Millisecond, "", errors.New("быстро упал")),
@@ -145,20 +134,48 @@ func demoAny() {
 		job("резерв-3", 10*time.Second, "этого никто не увидит", nil),
 	}
 
-	var firstOK string
-	for _, r := range settle.Stream(context.Background(), tasks...) {
-		if r.Err != nil {
-			fmt.Printf("  пропускаем неудачника: %v\n", r.Err)
-			continue // ошибка — не повод останавливаться
-		}
-		firstOK = r.Value
-		break // успех найден, остальных (включая «резерв-3») отменит break
+	value, err := settle.Any(context.Background(), tasks...)
+	if err != nil {
+		fmt.Printf("  все источники упали:\n%v\n", err)
+		return
 	}
-	fmt.Printf("  итог: %s\n", firstOK)
+	fmt.Printf("  итог: %s\n", value)
 }
 
-// Сценарий 5. Общий дедлайн через родительский контекст: Stream не имеет
-// собственных опций таймаута — и не нуждается в них, потому что таймаут
+// Сценарий 5. Stream нужен, когда готового правила недостаточно: результат
+// надо обработать сразу, его индекс влияет на решение или условие остановки
+// специфично для предметной области.
+func demoStream() {
+	section("Stream: собственная политика обработки")
+
+	names := []string{"профиль", "рекомендации", "заказы", "аудит"}
+	required := []bool{true, false, true, false}
+	tasks := []func(context.Context) (string, error){
+		job("профиль", 20*time.Millisecond, "Иван", nil),
+		job("рекомендации", 10*time.Millisecond, "", errors.New("сервис недоступен")),
+		job("заказы", 30*time.Millisecond, "", errors.New("нет прав")),
+		job("аудит", 10*time.Second, "записан", nil),
+	}
+
+	// Ни один готовый комбинатор не знает, что ошибка рекомендаций допустима,
+	// а ошибка заказов фатальна. Stream отдаёт индекс и каждый результат сразу,
+	// поэтому политику можно выразить непосредственно в цикле.
+loop:
+	for i, result := range settle.Stream(context.Background(), tasks...) {
+		switch {
+		case result.Err == nil:
+			fmt.Printf("  ✓ %s: %s\n", names[i], result.Value)
+		case required[i]:
+			fmt.Printf("  ✗ обязательный этап %s: %v\n", names[i], result.Err)
+			break loop
+		default:
+			fmt.Printf("  ~ %s пропущены: %v\n", names[i], result.Err)
+		}
+	}
+}
+
+// Сценарий 6. Общий дедлайн через родительский контекст: комбинаторы не имеют
+// собственных опций таймаута — и не нуждаются в них, потому что таймаут
 // это просто свойство ctx, который вы передаёте.
 func demoTimeout() {
 	section("таймаут: дедлайн всей пачки через контекст")
@@ -174,7 +191,7 @@ func demoTimeout() {
 
 	// Семантика allSettled сохраняется и при таймауте: ровно один результат
 	// на задачу, просто у опоздавших в Err лежит ошибка дедлайна.
-	for i, r := range settle.Stream(ctx, tasks...) {
+	for i, r := range settle.AllSettled(ctx, tasks...) {
 		switch {
 		case errors.Is(r.Err, context.DeadlineExceeded):
 			fmt.Printf("  #%d: не уложилась в дедлайн\n", i)
@@ -186,7 +203,7 @@ func demoTimeout() {
 	}
 }
 
-// Сценарий 6. Паники: задача может запаниковать, но процесс не упадёт —
+// Сценарий 7. Паники: задача может запаниковать, но процесс не упадёт —
 // паника приедет в Result.Err как *settle.PanicError. А если паниковали
 // ошибкой (идиома panic(err)), то через Unwrap до неё доберётся errors.Is.
 func demoPanic() {
@@ -208,7 +225,7 @@ func demoPanic() {
 		},
 	}
 
-	for i, r := range settle.Stream(context.Background(), tasks...) {
+	for i, r := range settle.AllSettled(context.Background(), tasks...) {
 		var pe *settle.PanicError
 		switch {
 		case errors.As(r.Err, &pe):
