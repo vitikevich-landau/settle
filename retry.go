@@ -115,14 +115,22 @@ func Retry[T any](p RetryPolicy, fn func(context.Context) (T, error)) func(conte
 // отменился раньше, чем истекла задержка. Без неё повторы продолжали бы спать
 // уже после того, как потребитель ушёл, и движок ждал бы их возврата.
 func sleepCtx(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		return ctx.Err()
+	// Отмена важнее истёкшего таймера, поэтому проверяем её дважды: до
+	// ожидания и в ветке таймера. При короткой паузе обе ветви select готовы
+	// одновременно, а выбор между готовыми случаен — без этих проверок
+	// повторы продолжались бы уже после отмены.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	if d <= 0 {
+		return nil
+	}
+
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-t.C:
-		return nil
+		return ctx.Err()
 	case <-ctx.Done():
 		return ctx.Err()
 	}

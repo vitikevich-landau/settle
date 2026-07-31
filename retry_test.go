@@ -382,3 +382,53 @@ func TestBackoffSaturatesInsteadOfOverflowing(t *testing.T) {
 		}
 	})
 }
+
+// Истёкший таймер паузы не должен выигрывать у отмены. При короткой задержке
+// обе ветви select готовы одновременно, а выбор между готовыми случаен —
+// поэтому без явного приоритета повторы продолжались бы уже после отмены,
+// затягивая остановку ровно на длительность лишней попытки.
+func TestRetryStopsWhenCancellationRacesTheTimer(t *testing.T) {
+	errTemporary := errors.New("temporary")
+
+	// Наносекундные паузы истекают мгновенно: к моменту select таймер уже
+	// сработал, и без приоритета отмена проигрывала бы примерно в половине
+	// случаев на каждом из ста повторов.
+	policy := RetryPolicy{Backoff: Constant(time.Nanosecond, 100)}
+
+	for range 50 {
+		ctx, cancel := context.WithCancel(context.Background())
+		var calls int
+
+		fn := Retry(policy, func(context.Context) (string, error) {
+			calls++
+			cancel() // отмена ровно перед уходом в паузу
+			return "", errTemporary
+		})
+
+		_, err := fn(ctx)
+		if calls != 1 {
+			t.Fatalf("попытка после отмены: сделано %d вызовов", calls)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("want context.Canceled, got %v", err)
+		}
+		cancel()
+	}
+}
+
+// Пауза нулевой длины на живом контексте — не ошибка: повтор просто
+// происходит немедленно.
+func TestSleepCtxWithNonPositiveDelay(t *testing.T) {
+	if err := sleepCtx(context.Background(), 0); err != nil {
+		t.Errorf("want nil for a zero pause, got %v", err)
+	}
+	if err := sleepCtx(context.Background(), -time.Second); err != nil {
+		t.Errorf("want nil for a negative pause, got %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sleepCtx(ctx, 0); !errors.Is(err, context.Canceled) {
+		t.Errorf("want context.Canceled, got %v", err)
+	}
+}
