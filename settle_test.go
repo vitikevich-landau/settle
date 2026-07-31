@@ -77,9 +77,9 @@ func TestAllSettledCollectsEverything(t *testing.T) {
 
 // Value едет к потребителю ровно таким, каким его вернула задача: если она
 // отдала частичный результат вместе с ошибкой, Stream ничего не занулит.
-// Тест закрепляет документированное поведение Result — соглашение «при
-// Err != nil в Value лежит нулевое значение» соблюдает автор задачи, а не
-// библиотека, и рассчитывать на зануление со стороны Stream нельзя.
+// Тест закрепляет документированное поведение Result: смысл Value при ошибке
+// задаёт контракт самой задачи, а рассчитывать на зануление со стороны Stream
+// нельзя.
 func TestPartialValueSurvivesError(t *testing.T) {
 	base := runtime.NumGoroutine()
 	errTruncated := errors.New("truncated")

@@ -149,10 +149,14 @@ func copyContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, erro
 		}
 		n, err := src.Read(buf)
 		if n > 0 {
-			if _, werr := dst.Write(buf[:n]); werr != nil {
+			written, werr := dst.Write(buf[:n])
+			total += int64(written)
+			if werr != nil {
 				return total, werr
 			}
-			total += int64(n)
+			if written != n {
+				return total, io.ErrShortWrite
+			}
 		}
 		switch {
 		case err == io.EOF:
@@ -173,7 +177,7 @@ func makeSampleFiles() (dir string, paths []string) {
 	for i := range 9 {
 		name := fmt.Sprintf("data-%02d.bin", i)
 		path := filepath.Join(dir, name)
-		// Размер растёт с номером: от 4 КиБ до почти мегабайта.
+		// Размер растёт с номером: от 4 КиБ до четверти мегабайта.
 		content := bytes.Repeat([]byte{byte('a' + i)}, 4<<10*(i*i+1))
 		if err := os.WriteFile(path, content, 0o600); err != nil {
 			panic(err)
