@@ -345,3 +345,89 @@ func TestMapRerunsOnEachRange(t *testing.T) {
 	}
 	waitNoExtraGoroutines(t, base)
 }
+
+// Отмена внешнего контекста обязана разрывать и чтение входа, иначе Map не
+// смог бы вернуться из обхода блокирующего источника.
+func TestFromChannelStopsOnCancellation(t *testing.T) {
+	base := runtime.NumGoroutine()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Канал, в который никто больше не пишет: без реакции на отмену обход
+	// повис бы здесь навсегда.
+	jobs := make(chan int, 1)
+	jobs <- 1
+
+	done := make(chan struct{})
+	var seen int
+	go func() {
+		defer close(done)
+		for range Map(ctx, FromChannel(ctx, jobs), 2,
+			func(_ context.Context, v int) (int, error) { return v, nil }) {
+			seen++
+			cancel() // получили первый результат — сворачиваем всё
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Map не вернулся после отмены: чтение входа не прервалось")
+	}
+	if seen != 1 {
+		t.Errorf("want 1 result, got %d", seen)
+	}
+	waitNoExtraGoroutines(t, base)
+}
+
+func TestFromChannelStopsOnClose(t *testing.T) {
+	base := runtime.NumGoroutine()
+	jobs := make(chan int, 3)
+	for i := range 3 {
+		jobs <- i
+	}
+	close(jobs)
+
+	var seen int
+	for _, r := range Map(context.Background(), FromChannel(context.Background(), jobs), 2,
+		func(_ context.Context, v int) (int, error) { return v, nil }) {
+		if r.Err != nil {
+			t.Fatalf("unexpected error: %v", r.Err)
+		}
+		seen++
+	}
+	if seen != 3 {
+		t.Fatalf("want 3 results, got %d", seen)
+	}
+	waitNoExtraGoroutines(t, base)
+}
+
+// После ухода потребителя диспетчер не имеет права запустить ни одной новой
+// задачи, даже если слоты свободны: выбор готовой ветви в select случаен,
+// поэтому отмена проверяется до занятия слота.
+func TestMapStartsNoTasksAfterBreak(t *testing.T) {
+	base := runtime.NumGoroutine()
+
+	var started atomic.Int64
+	items := make([]int, 500)
+	for i := range items {
+		items[i] = i
+	}
+
+	for range Map(context.Background(), slices.Values(items), 2,
+		func(_ context.Context, v int) (int, error) {
+			started.Add(1)
+			return v, nil
+		}) {
+		break
+	}
+
+	afterBreak := started.Load()
+	time.Sleep(50 * time.Millisecond)
+	if now := started.Load(); now != afterBreak {
+		t.Fatalf("после break стартовали новые задачи: было %d, стало %d", afterBreak, now)
+	}
+	if afterBreak >= int64(len(items)) {
+		t.Errorf("вход обработан целиком (%d задач) несмотря на ранний выход", afterBreak)
+	}
+	waitNoExtraGoroutines(t, base)
+}

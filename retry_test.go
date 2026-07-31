@@ -238,3 +238,59 @@ func TestRetryInsideMapKeepsOneResultPerTask(t *testing.T) {
 	}
 	waitNoExtraGoroutines(t, base)
 }
+
+// Пакет не зануляет Value при ошибке, и Retry не имеет права это менять:
+// частичный результат задачи должен доезжать до потребителя во всех исходах.
+func TestRetryPreservesPartialValue(t *testing.T) {
+	errFatal := errors.New("fatal")
+	errTemporary := errors.New("temporary")
+
+	t.Run("неповторяемая ошибка", func(t *testing.T) {
+		fn := Retry(RetryPolicy{
+			Backoff:   Constant(time.Millisecond, 3),
+			Retryable: func(err error) bool { return errors.Is(err, errTemporary) },
+		}, func(context.Context) (string, error) {
+			return "частичный результат", errFatal
+		})
+
+		v, err := fn(context.Background())
+		if !errors.Is(err, errFatal) {
+			t.Fatalf("want fatal, got %v", err)
+		}
+		if v != "частичный результат" {
+			t.Errorf("значение потеряно: got %q", v)
+		}
+	})
+
+	t.Run("повторы исчерпаны", func(t *testing.T) {
+		fn := Retry(RetryPolicy{Backoff: Constant(time.Millisecond, 2)},
+			func(context.Context) (string, error) {
+				return "частичный результат", errTemporary
+			})
+
+		v, err := fn(context.Background())
+		if !errors.Is(err, errTemporary) {
+			t.Fatalf("want temporary, got %v", err)
+		}
+		if v != "частичный результат" {
+			t.Errorf("значение последней попытки потеряно: got %q", v)
+		}
+	})
+
+	t.Run("отмена во время паузы", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		fn := Retry(RetryPolicy{Backoff: Constant(10*time.Second, 3)},
+			func(context.Context) (string, error) {
+				cancel()
+				return "частичный результат", errTemporary
+			})
+
+		v, err := fn(ctx)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("want cancellation, got %v", err)
+		}
+		if v != "частичный результат" {
+			t.Errorf("значение потеряно при отмене: got %q", v)
+		}
+	})
+}

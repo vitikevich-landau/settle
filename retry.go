@@ -46,6 +46,12 @@ type RetryPolicy struct {
 //     причины отмены, так что [errors.Is] находит и предметную ошибку, и
 //     context.Canceled / context.DeadlineExceeded.
 //
+// Во всех неуспешных исходах возвращается значение ПОСЛЕДНЕЙ попытки, а не
+// нулевое: пакет принципиально не зануляет Value при ошибке (см. [Result]), и
+// декоратор не имеет права менять это свойство задачи. Задача в духе
+// io.Reader, отдающая частичный результат вместе с ошибкой, остаётся такой же
+// и под Retry.
+//
 // Паника внутри задачи не повторяется: паника — это дефект кода, а не
 // временный сбой, поэтому она летит дальше и превращается в *[PanicError] уже
 // в движке.
@@ -63,20 +69,24 @@ func Retry[T any](p RetryPolicy, fn func(context.Context) (T, error)) func(conte
 	return func(ctx context.Context) (T, error) {
 		var (
 			zero     T
+			lastVal  T
 			lastErr  error
 			attempts int
 		)
 
+		// Значение последней попытки не выбрасывается ни в одной ветке: пакет
+		// принципиально не зануляет Value при ошибке (см. [Result]), и
+		// декоратор не имеет права менять это поведение задачи.
 		attempt := func() (T, error, bool) {
 			attempts++
 			v, err := fn(ctx)
+			lastVal, lastErr = v, err
 			switch {
 			case err == nil:
 				return v, nil, true
 			case !retryable(err):
-				return zero, err, true
+				return v, err, true
 			}
-			lastErr = err
 			return zero, nil, false
 		}
 
@@ -89,7 +99,7 @@ func Retry[T any](p RetryPolicy, fn func(context.Context) (T, error)) func(conte
 				if err := sleepCtx(ctx, delay); err != nil {
 					// Пауза прервана: повторять уже некуда, но и терять
 					// предметную причину неудачи не стоит — отдаём обе.
-					return zero, errors.Join(lastErr, err)
+					return lastVal, errors.Join(lastErr, err)
 				}
 				if v, err, done := attempt(); done {
 					return v, err
@@ -97,7 +107,7 @@ func Retry[T any](p RetryPolicy, fn func(context.Context) (T, error)) func(conte
 			}
 		}
 
-		return zero, fmt.Errorf("settle: %d attempts: %w", attempts, lastErr)
+		return lastVal, fmt.Errorf("settle: %d attempts: %w", attempts, lastErr)
 	}
 }
 
