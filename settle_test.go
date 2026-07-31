@@ -75,6 +75,66 @@ func TestAllSettledCollectsEverything(t *testing.T) {
 	waitNoExtraGoroutines(t, base)
 }
 
+// Value едет к потребителю ровно таким, каким его вернула задача: если она
+// отдала частичный результат вместе с ошибкой, Stream ничего не занулит.
+// Тест закрепляет документированное поведение Result — соглашение «при
+// Err != nil в Value лежит нулевое значение» соблюдает автор задачи, а не
+// библиотека, и рассчитывать на зануление со стороны Stream нельзя.
+func TestPartialValueSurvivesError(t *testing.T) {
+	base := runtime.NumGoroutine()
+	errTruncated := errors.New("truncated")
+
+	const partial = "прочитано наполовину"
+	fns := []func(context.Context) (string, error){
+		func(ctx context.Context) (string, error) { return partial, errTruncated },
+		func(ctx context.Context) (string, error) { return "целиком", nil },
+	}
+
+	got := make(map[int]Result[string], len(fns))
+	for i, r := range Stream(context.Background(), fns...) {
+		got[i] = r
+	}
+
+	if len(got) != len(fns) {
+		t.Fatalf("want %d results, got %d", len(fns), len(got))
+	}
+	// Главное утверждение теста: оба поля доехали одновременно.
+	if r := got[0]; !errors.Is(r.Err, errTruncated) || r.Value != partial {
+		t.Errorf("task 0: want (%q, errTruncated), got (%q, %v)", partial, r.Value, r.Err)
+	}
+	if r := got[1]; r.Err != nil || r.Value != "целиком" {
+		t.Errorf("task 1: want (%q, nil), got (%q, %v)", "целиком", r.Value, r.Err)
+	}
+	waitNoExtraGoroutines(t, base)
+}
+
+// Единственное исключение из предыдущего теста: при панике и runtime.Goexit
+// возврата задачи не существует, поэтому Result собирает сам Stream — и
+// Value в нём гарантированно нулевой, что бы задача ни успела насчитать.
+func TestValueIsZeroOnPanicAndGoexit(t *testing.T) {
+	base := runtime.NumGoroutine()
+
+	fns := []func(context.Context) (string, error){
+		func(ctx context.Context) (string, error) { panic("boom") },
+		func(ctx context.Context) (string, error) { runtime.Goexit(); return "недостижимо", nil },
+	}
+
+	count := 0
+	for i, r := range Stream(context.Background(), fns...) {
+		count++
+		if r.Err == nil {
+			t.Errorf("task %d: want error, got nil", i)
+		}
+		if r.Value != "" {
+			t.Errorf("task %d: want zero Value, got %q", i, r.Value)
+		}
+	}
+	if count != len(fns) {
+		t.Fatalf("want %d results, got %d", len(fns), count)
+	}
+	waitNoExtraGoroutines(t, base)
+}
+
 // Результаты приходят в порядке завершения задач, а не в порядке аргументов.
 // Порядок здесь детерминированный, без единого sleep: следующая задача
 // отпирается только после того, как потребитель получил результат
