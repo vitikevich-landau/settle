@@ -1,0 +1,66 @@
+package settle
+
+import (
+	"context"
+	"time"
+)
+
+// Timeout ограничивает время одного вызова задачи: декорированная функция
+// получает производный контекст с дедлайном, а по его истечении задача
+// обязана вернуться сама — отмена в Go кооперативна, и Timeout не может
+// прервать функцию, игнорирующую ctx.
+//
+// Дедлайн отсчитывается заново на каждый вызов, поэтому в связке с [Retry]
+// порядок обёрток задаёт смысл:
+//
+//	settle.Retry(policy, settle.Timeout(2*time.Second, fetch)) // 2 секунды на попытку
+//	settle.Timeout(2*time.Second, settle.Retry(policy, fetch)) // 2 секунды на все попытки
+//
+// Общий дедлайн всей пачки задавать так не нужно — это просто свойство
+// контекста, переданного в [Stream] или [Map].
+func Timeout[T any](d time.Duration, fn func(context.Context) (T, error)) func(context.Context) (T, error) {
+	return func(ctx context.Context) (T, error) {
+		ctx, cancel := context.WithTimeout(ctx, d)
+		defer cancel()
+		return fn(ctx)
+	}
+}
+
+// Hooks — точки наблюдения за одной задачей. Любое поле может быть nil.
+type Hooks struct {
+	// Start вызывается перед началом задачи.
+	Start func()
+	// Done вызывается после обычного возврата задачи и получает затраченное
+	// время и её ошибку (nil при успехе).
+	Done func(elapsed time.Duration, err error)
+}
+
+// Observe навешивает на задачу измерение времени и вызовы хуков — то, из чего
+// обычно собирают метрики и трейсы: счётчик запусков, гистограмма длительности,
+// доля ошибок.
+//
+// Хуки вызываются в горутине задачи, то есть конкурентно с хуками других
+// задач: замыкания обязаны быть безопасными для параллельного вызова.
+// Счётчики из sync/atomic и клиенты метрик такими и являются, а вот запись в
+// общую карту или срез — нет.
+//
+// Если задача запаниковала или завершила горутину через runtime.Goexit, Done
+// не вызывается: значения ошибки в этот момент не существует, а выдумывать
+// успех значило бы врать метрике. Расхождение счётчиков Start и Done как раз
+// и показывает такие случаи, а сама паника доедет до потребителя нормальным
+// путём — как *[PanicError] в Result.Err.
+func Observe[T any](h Hooks, fn func(context.Context) (T, error)) func(context.Context) (T, error) {
+	return func(ctx context.Context) (T, error) {
+		if h.Start != nil {
+			h.Start()
+		}
+		start := time.Now()
+
+		v, err := fn(ctx)
+
+		if h.Done != nil {
+			h.Done(time.Since(start), err)
+		}
+		return v, err
+	}
+}
