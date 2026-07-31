@@ -3,6 +3,7 @@ package settle
 import (
 	"context"
 	"errors"
+	"math"
 	"runtime"
 	"slices"
 	"strings"
@@ -331,4 +332,53 @@ func TestJitterClampsFraction(t *testing.T) {
 			t.Fatalf("delay %s out of [0, 200ms]", d)
 		}
 	}
+}
+
+// Задержки у верхней границы диапазона обязаны насыщаться, а не переполняться.
+// Отрицательная длительность для sleepCtx означает «не спать вовсе», то есть
+// очень долгая пауза обернулась бы мгновенным повтором.
+func TestBackoffSaturatesInsteadOfOverflowing(t *testing.T) {
+	const maxDuration = time.Duration(math.MaxInt64)
+
+	t.Run("Jitter поверх предельной задержки", func(t *testing.T) {
+		var seen int
+		for d := range Jitter(Constant(maxDuration, 200), 0.5) {
+			if d <= 0 {
+				t.Fatalf("переполнение: задержка %d", d)
+			}
+			seen++
+		}
+		if seen != 200 {
+			t.Fatalf("want 200 delays, got %d", seen)
+		}
+	})
+
+	t.Run("Exponential упирается в потолок", func(t *testing.T) {
+		// Растёт быстро и заведомо выходит за int64 — и обязан остановиться
+		// на максимуме, а не уйти в минус.
+		var last time.Duration
+		for d := range Exponential(maxDuration/4, 8, 10) {
+			if d <= 0 {
+				t.Fatalf("переполнение: задержка %d", d)
+			}
+			last = d
+		}
+		if last != maxDuration {
+			t.Errorf("want the sequence to saturate at %d, got %d", maxDuration, last)
+		}
+	})
+
+	t.Run("предельное значение переживает конвертацию", func(t *testing.T) {
+		// float64(math.MaxInt64) округляется вверх до 2^63 — на единицу
+		// больше, чем помещается в int64.
+		if got := toDuration(float64(math.MaxInt64)); got != maxDuration {
+			t.Errorf("want %d, got %d", maxDuration, got)
+		}
+		if got := toDuration(math.Inf(1)); got != maxDuration {
+			t.Errorf("want %d for +Inf, got %d", maxDuration, got)
+		}
+		if got := toDuration(-1); got != 0 {
+			t.Errorf("want 0 for a negative input, got %d", got)
+		}
+	})
 }

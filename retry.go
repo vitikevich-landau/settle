@@ -139,16 +139,34 @@ func Exponential(base time.Duration, factor float64, retries int) iter.Seq[time.
 	return func(yield func(time.Duration) bool) {
 		d := float64(base)
 		for range retries {
-			if !yield(time.Duration(d)) {
+			if !yield(toDuration(d)) {
 				return
 			}
 			d *= factor
-			// Страховка от переполнения при большом числе повторов: дальше
-			// расти всё равно некуда, а time.Duration ушла бы в минус.
-			if d > math.MaxInt64 {
-				d = math.MaxInt64
-			}
 		}
+	}
+}
+
+// toDuration переводит секунды-в-плавающей-точке в time.Duration, насыщая
+// результат вместо переполнения.
+//
+// Обычное преобразование здесь — ловушка: при выходе за диапазон int64 оно
+// даёт неопределённый результат, на практике отрицательный. Отрицательная
+// задержка для sleepCtx означает «не спать вовсе», то есть очень долгая пауза
+// превратилась бы в мгновенный повтор — поведение, противоположное
+// задуманному.
+//
+// Сравнение идёт с math.MaxInt64 в плавающей точке, где эта константа
+// округляется вверх до 2⁶³ — на единицу больше, чем помещается в int64.
+// Поэтому граница нестрогая: значения, равные ей, тоже насыщаются.
+func toDuration(f float64) time.Duration {
+	switch {
+	case f >= math.MaxInt64:
+		return time.Duration(math.MaxInt64)
+	case f <= 0:
+		return 0
+	default:
+		return time.Duration(f)
 	}
 }
 
@@ -206,7 +224,11 @@ func Jitter(seq iter.Seq[time.Duration], frac float64) iter.Seq[time.Duration] {
 			// использования, поэтому одну и ту же политику можно смело
 			// раздать всем задачам пачки.
 			k := 1 + frac*(2*rand.Float64()-1)
-			if !yield(time.Duration(float64(d) * k)) {
+			// Насыщение обязательно: источник вполне может отдать задержку у
+			// верхней границы диапазона — [Exponential] именно ею и
+			// заканчивается, — а множитель больше единицы вывел бы
+			// произведение за пределы int64.
+			if !yield(toDuration(float64(d) * k)) {
 				return
 			}
 		}
