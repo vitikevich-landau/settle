@@ -95,8 +95,15 @@ func demoChecksums() {
 		total += r.Value.Size
 		fmt.Printf("  ✓ %-14s %s  %d байт\n", r.Value.Name, r.Value.Hash, r.Value.Size)
 	}
+	// Знаменатель — len(paths), а не len(results): если дедлайн истёк между
+	// пачками, до части путей обход не добрался, и в results их просто нет.
+	// Считать «сколько успели» от «сколько успели» — верный способ отчитаться
+	// «4 из 4» там, где на входе было десять файлов.
 	fmt.Printf("  → посчитано %d файлов из %d (%d байт) пачками по %d за %s\n",
-		hashed, len(results), total, batch, since(start))
+		hashed, len(paths), total, batch, since(start))
+	if skipped := len(paths) - len(results); skipped > 0 {
+		fmt.Printf("     до %d файлов обход не добрался: истёк дедлайн\n", skipped)
+	}
 }
 
 // hashFile собирает задачу, считающую SHA-256 одного файла.
