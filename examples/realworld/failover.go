@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,9 +15,9 @@ import (
 // Сценарий 2. Отказоустойчивое чтение: одни и те же данные лежат в нескольких
 // репликах, нам нужен первый успешный ответ.
 //
-// Это Promise.any: ошибка одной реплики — не повод сдаваться, но и ждать всех
-// незачем. Как только пришёл первый успех, остальные запросы бессмысленны, и
-// break их отменяет — чужие сервисы перестают тратить на нас ресурсы.
+// Это готовый Any: ошибка одной реплики — не повод сдаваться, но и ждать всех
+// после первого успеха незачем. Комбинатор отменяет остальные запросы —
+// чужие сервисы перестают тратить на нас ресурсы.
 //
 // Второй приём здесь — hedged requests. Дублировать запрос сразу во все
 // реплики значит утроить нагрузку на бэкенд ради редких «хвостовых» задержек.
@@ -27,8 +26,9 @@ import (
 
 // rate — котировка валютной пары, ответ реплики.
 type rate struct {
-	Pair  string  `json:"pair"`
-	Value float64 `json:"value"`
+	Pair    string  `json:"pair"`
+	Value   float64 `json:"value"`
+	Replica string  `json:"-"`
 }
 
 // replica — описание одной реплики стенда.
@@ -79,15 +79,14 @@ func demoFailover() {
 	fmt.Println("\n-- прогон 1: eu-1 отвечает 503, побеждает eu-2")
 	askReplicas(replicas, "")
 
-	// Прогон 2: живых реплик нет. Цикл дойдёт до конца, ни разу не сделав
-	// break, и мы соберём все ошибки — это ровно AggregateError из
-	// Promise.any, только собранный через errors.Join.
+	// Прогон 2: живых реплик нет. Any дождётся всех и вернёт errors.Join,
+	// аналог AggregateError из Promise.any.
 	fmt.Println("\n-- прогон 2: живых реплик нет")
 	askReplicas(replicas, "?fail=1")
 }
 
-// askReplicas реализует Promise.any: первый успех побеждает, ошибки
-// накапливаются, и если успеха не случилось — отдаём их все разом.
+// askReplicas использует Any: первый успех побеждает, ошибки накапливаются,
+// и если успеха не случилось — приезжают все разом.
 func askReplicas(replicas []*replica, query string) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -100,45 +99,35 @@ func askReplicas(replicas []*replica, query string) {
 	tasks := make([]func(context.Context) (rate, error), len(replicas))
 	for i, rep := range replicas {
 		url := rep.url + query
+		name := rep.name
 		tasks[i] = hedged(rep.hedge, func(ctx context.Context) (rate, error) {
 			requestsIssued.Add(1)
-			return fetchJSON[rate](ctx, url)
+			value, err := fetchJSON[rate](ctx, url)
+			if err != nil {
+				return rate{}, fmt.Errorf("%s: %w", name, err)
+			}
+			value.Replica = name
+			return value, nil
 		})
 	}
 
 	start := time.Now()
-	var (
-		winner rate
-		from   string
-		errs   []error
-	)
-
-	for i, r := range settle.Stream(ctx, tasks...) {
-		if r.Err != nil {
-			// Ошибка реплики — не конец: продолжаем слушать остальных.
-			fmt.Printf("  ✗ %s: %v\n", replicas[i].name, shortErr(r.Err))
-			errs = append(errs, fmt.Errorf("%s: %w", replicas[i].name, r.Err))
-			continue
-		}
-		winner, from = r.Value, replicas[i].name
-		break // отменяет отставших и не даёт стартовать тем, чей дубль отложен
-	}
-
-	if from == "" {
-		// errors.Join складывает ошибки в одну; errors.Is и errors.As умеют
-		// искать по всем ветвям сразу, так что сентинели не теряются.
-		fmt.Printf("  → ни одна реплика не ответила за %s:\n%v\n",
-			since(start), indent(errors.Join(errs...).Error()))
+	winner, err := settle.Any(ctx, tasks...)
+	if err != nil {
+		// Any оборачивает каждую ошибку индексом и складывает их через
+		// errors.Join в исходном порядке реплик.
+		fmt.Printf("  → ни одна реплика не ответила за %s:\n%s\n",
+			since(start), indent(err.Error()))
 		return
 	}
 
 	fmt.Printf("  → %s = %.2f от %s за %s; запросов ушло в сеть: %d из %d\n",
-		winner.Pair, winner.Value, from, since(start), requestsIssued.Load(), len(tasks))
+		winner.Pair, winner.Value, winner.Replica, since(start), requestsIssued.Load(), len(tasks))
 }
 
-// hedged откладывает старт задачи на delay. Если победитель нашёлся раньше,
-// break отменит контекст ещё до того, как эта задача что-то отправит: дубль
-// не будет стоить ни запроса, ни соединения.
+// hedged откладывает старт задачи на delay. Если Any нашёл победителя раньше,
+// он отменит контекст ещё до того, как эта задача что-то отправит: дубль не
+// будет стоить ни запроса, ни соединения.
 //
 // Приём окупается, когда p50 сервиса заметно ниже p99: задержку выбирают на
 // уровне где-то p90, и тогда дубли уходят только для «хвоста» запросов.

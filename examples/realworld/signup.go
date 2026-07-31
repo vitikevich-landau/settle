@@ -18,7 +18,7 @@ import (
 // значит складывать задержки на ровном месте. Но и доводить до конца все
 // проверки, когда одна уже отказала, незачем: решение принято, а обращение
 // к антифроду стоит денег за вызов и жжёт квоту у внешнего провайдера.
-// break здесь — это не оптимизация задержки, а прямая экономия бюджета.
+// Ранний выход All здесь — не оптимизация задержки, а прямая экономия бюджета.
 //
 // Второй сюжет сценария — разница между двумя видами неудач:
 //
@@ -69,8 +69,8 @@ func signup(form signupForm, nicknameServiceDown bool) {
 
 	antifraudBilled.Store(0)
 
-	// Задачи возвращают имя проверки: сами данные никому не нужны, важен
-	// только вердикт. Result.Value идёт в лог и в текст ошибки для клиента.
+	// Задачи возвращают имя проверки: All соберёт эти имена в исходном
+	// порядке, если успешно завершатся все.
 	tasks := []func(context.Context) (string, error){
 		checkNickname(form.Nickname, nicknameServiceDown),
 		checkEmailDomain(form.Email),
@@ -78,38 +78,24 @@ func signup(form signupForm, nicknameServiceDown bool) {
 	}
 
 	start := time.Now()
-	var (
-		rejection error // бизнес-отказ: 400
-		failure   error // поломка: 503
-	)
-
-loop:
-	for _, r := range settle.Stream(ctx, tasks...) {
-		switch {
-		case r.Err == nil:
-			fmt.Printf("  ✓ %s — пройдена за %s\n", r.Value, since(start))
-
-		case errors.Is(r.Err, errRejected):
-			rejection = r.Err
-			// Решение принято, остальные проверки уже ни на что не влияют.
-			// break отменяет их контекст — антифрод не успеет выставить счёт.
-			break loop
-
-		default:
-			failure = r.Err
-			// Поломка тоже прерывает: без полного набора вердиктов регистрировать
-			// пользователя нельзя, а держать остальные проверки — только жечь
-			// бюджет.
-			break loop
-		}
+	// Первая ошибка отменяет остальные проверки. All вернётся лишь после
+	// того, как они отреагируют на ctx, поэтому антифрод уже точно перестал
+	// работать и не выставит счёт после принятого решения.
+	passed, err := settle.All(ctx, tasks...)
+	// All добавляет индекс задачи — полезно для логов и диагностики. В ответ
+	// клиенту отдаём исходную предметную ошибку без внутренней нумерации.
+	cause := errors.Unwrap(err)
+	if cause == nil {
+		cause = err
 	}
 
 	switch {
-	case rejection != nil:
-		fmt.Printf("  → 400: %v\n", rejection)
-	case failure != nil:
-		fmt.Printf("  → 503: %v (клиенту стоит повторить)\n", failure)
+	case errors.Is(err, errRejected):
+		fmt.Printf("  → 400: %v\n", cause)
+	case err != nil:
+		fmt.Printf("  → 503: %v (клиенту стоит повторить)\n", cause)
 	default:
+		fmt.Printf("  ✓ пройдены: %s\n", strings.Join(passed, ", "))
 		fmt.Printf("  → 201: пользователь %q зарегистрирован\n", form.Nickname)
 	}
 	fmt.Printf("     заняло %s, платных вызовов антифрода: %d\n",
@@ -151,7 +137,7 @@ func checkEmailDomain(email string) func(context.Context) (string, error) {
 }
 
 // checkIPReputation — внешний платный антифрод: медленный и с ценником за
-// каждый вызов. Именно ради него в этом сценарии и нужен break.
+// каждый вызов. Именно ради него All отменяет остальные проверки при ошибке.
 func checkIPReputation(ip string) func(context.Context) (string, error) {
 	return func(ctx context.Context) (string, error) {
 		if err := sleepCtx(ctx, 200*time.Millisecond); err != nil {
