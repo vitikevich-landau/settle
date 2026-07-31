@@ -431,3 +431,29 @@ func TestMapStartsNoTasksAfterBreak(t *testing.T) {
 	}
 	waitNoExtraGoroutines(t, base)
 }
+
+// Уже отменённый контекст обязан выигрывать у непустого канала: иначе элемент
+// был бы изъят из очереди и потерян — задачу под ним Map уже не запустит.
+// Проверяем в цикле, потому что при обеих готовых ветвях select выбирает
+// случайно: одиночный прогон прошёл бы и без приоритета отмены.
+func TestFromChannelPrefersCancellationOverBufferedValue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for range 200 {
+		ch := make(chan int, 1)
+		ch <- 42
+
+		var yielded int
+		for range FromChannel(ctx, ch) {
+			yielded++
+		}
+
+		if yielded != 0 {
+			t.Fatalf("отдан элемент после отмены (%d штук)", yielded)
+		}
+		if len(ch) != 1 {
+			t.Fatalf("элемент изъят из канала и потерян")
+		}
+	}
+}

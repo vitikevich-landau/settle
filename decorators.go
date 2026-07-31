@@ -16,6 +16,15 @@ import (
 //	settle.Retry(policy, settle.Timeout(2*time.Second, fetch)) // 2 секунды на попытку
 //	settle.Timeout(2*time.Second, settle.Retry(policy, fetch)) // 2 секунды на все попытки
 //
+// В первом варианте есть ловушка, о которую легко споткнуться в
+// RetryPolicy.Retryable: сработавший Timeout даёт ошибку, оборачивающую
+// context.DeadlineExceeded, и она НЕ отличима от общего дедлайна всей
+// выгрузки — контексты разные, а сентинел один. Предикат, отвергающий
+// DeadlineExceeded как «мы уходим», тем самым запрещает повтор медленного
+// ответа и обесценивает всю связку. Отличать эти случаи и не нужно: когда
+// истечёт общий дедлайн, повторы остановит пауза — sleepCtx внутри [Retry]
+// вернёт ошибку контекста, не досыпая.
+//
 // Общий дедлайн всей пачки задавать так не нужно — это просто свойство
 // контекста, переданного в [Stream] или [Map].
 func Timeout[T any](d time.Duration, fn func(context.Context) (T, error)) func(context.Context) (T, error) {
