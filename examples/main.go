@@ -5,19 +5,22 @@
 //	go run ./examples
 //
 // Каждая demo-функция ниже — отдельный сценарий использования: готовые
-// комбинаторы AllSettled, All, Race и Any, затем низкоуровневый Stream,
+// комбинаторы AllSettled, All, Race и Any, низкоуровневый Stream, движок Map с
+// ограничением параллелизма, трансформеры Ordered и Batch, декоратор Retry,
 // общий дедлайн и перехват паник.
 //
 // Задачи здесь намеренно синтетические: они просто спят, чтобы был виден сам
 // механизм. Те же приёмы на работе, похожей на боевую — HTTP-запросы к
-// микросервисам, чтение файлов с диска, ручка здоровья, — лежат в
-// ./examples/realworld.
+// микросервисам, чтение файлов с диска, ручка здоровья, обход большого списка
+// ссылок, — лежат в ./examples/realworld.
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/vitikevich-landau/settle"
@@ -29,6 +32,9 @@ func main() {
 	demoRace()
 	demoAny()
 	demoStream()
+	demoMap()
+	demoOrdered()
+	demoRetry()
 	demoTimeout()
 	demoPanic()
 }
@@ -174,7 +180,156 @@ loop:
 	}
 }
 
-// Сценарий 6. Общий дедлайн через родительский контекст: комбинаторы не имеют
+// Сценарий 6. Map: работы много, а параллелизм нужно ограничить. Stream
+// запустил бы горутину на каждую задачу — при списке в миллион элементов это
+// уже проблема. Map держит в полёте не больше n и читает вход лениво.
+func demoMap() {
+	section("Map: ограниченный параллелизм над длинным входом")
+
+	// Вход — обычная последовательность. Она может быть и бесконечной, и
+	// читаемой из файла: Map не материализует её в срез.
+	ids := make([]int, 12)
+	for i := range ids {
+		ids[i] = i + 1
+	}
+
+	var inFlight, peak atomic.Int64
+
+	// Не больше трёх задач одновременно, каким бы длинным ни был вход.
+	results := settle.Map(context.Background(), slices.Values(ids), 3,
+		func(_ context.Context, id int) (string, error) {
+			now := inFlight.Add(1)
+			for {
+				max := peak.Load()
+				if now <= max || peak.CompareAndSwap(max, now) {
+					break
+				}
+			}
+			defer inFlight.Add(-1)
+
+			time.Sleep(10 * time.Millisecond)
+			if id%5 == 0 {
+				return "", fmt.Errorf("элемент %d: временный сбой", id)
+			}
+			return fmt.Sprintf("готово-%d", id), nil
+		})
+
+	// Values отдаёт успехи в порядке входа, а неудачи складывает в одну
+	// ошибку — в отличие от All частичный успех не теряется.
+	values, err := settle.Values(results)
+	fmt.Printf("  успешно обработано %d из %d, пик параллелизма: %d\n",
+		len(values), len(ids), peak.Load())
+	if err != nil {
+		fmt.Printf("  не получилось:\n%s\n", indent(err.Error()))
+	}
+}
+
+// Сценарий 7. Ordered: результаты приходят по готовности, а нужны в исходном
+// порядке. Трансформер не ждёт конца обхода — он отдаёт очередной результат,
+// как только пришли все предыдущие.
+func demoOrdered() {
+	section("Ordered: исходный порядок без ожидания всей пачки")
+
+	// Чем позже элемент во входе, тем быстрее он считается: без Ordered
+	// результаты приехали бы задом наперёд.
+	delays := []int{50, 40, 30, 20, 10}
+
+	fmt.Println("  без Ordered (порядок завершения):")
+	for i := range settle.Map(context.Background(), slices.Values(delays), 5,
+		sleepMS) {
+		fmt.Printf("    #%d\n", i)
+	}
+
+	fmt.Println("  с Ordered (порядок входа):")
+	for i, r := range settle.Ordered(settle.Map(context.Background(),
+		slices.Values(delays), 5, sleepMS)) {
+		fmt.Printf("    #%d: %s\n", i, r.Value)
+	}
+}
+
+// sleepMS — задача для demoOrdered: спит указанное число миллисекунд.
+func sleepMS(ctx context.Context, ms int) (string, error) {
+	select {
+	case <-time.After(time.Duration(ms) * time.Millisecond):
+		return fmt.Sprintf("%dмс", ms), nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// Сценарий 8. Retry: временный сбой — не повод терять задачу. Декоратор
+// оборачивает саму функцию, поэтому движок по-прежнему видит ровно один
+// результат на задачу, а индексы не съезжают.
+func demoRetry() {
+	section("Retry: повторы с растущей паузой")
+
+	errTemporary := errors.New("503 сервис недоступен")
+	errFatal := errors.New("400 неверный запрос")
+
+	policy := settle.RetryPolicy{
+		// Паузы — обычная последовательность, поэтому их можно комбинировать:
+		// экспонента, обрезанная потолком и размытая джиттером.
+		Backoff: settle.Jitter(settle.Cap(
+			settle.Exponential(5*time.Millisecond, 2, 4), 50*time.Millisecond), 0.3),
+		// Повторяем только временные сбои: на 400 повтор бессмыслен и лишь
+		// тратит время и чужие ресурсы.
+		Retryable: func(err error) bool { return errors.Is(err, errTemporary) },
+	}
+
+	var attempts [3]atomic.Int64
+	tasks := []func(context.Context) (string, error){
+		// Оживёт с третьей попытки.
+		settle.Retry(policy, func(context.Context) (string, error) {
+			if attempts[0].Add(1) < 3 {
+				return "", errTemporary
+			}
+			return "ожил", nil
+		}),
+		// Не оживёт никогда: повторы исчерпаются.
+		settle.Retry(policy, func(context.Context) (string, error) {
+			attempts[1].Add(1)
+			return "", errTemporary
+		}),
+		// Фатальная ошибка: повторять нечего, вернётся сразу.
+		settle.Retry(policy, func(context.Context) (string, error) {
+			attempts[2].Add(1)
+			return "", errFatal
+		}),
+	}
+
+	names := []string{"мигающий", "мёртвый", "неверный запрос"}
+	for i, r := range settle.Ordered(settle.Stream(context.Background(), tasks...)) {
+		switch {
+		case r.Err != nil:
+			fmt.Printf("  ✗ %s (попыток: %d): %v\n", names[i], attempts[i].Load(), r.Err)
+		default:
+			fmt.Printf("  ✓ %s (попыток: %d): %s\n", names[i], attempts[i].Load(), r.Value)
+		}
+	}
+}
+
+// indent сдвигает многострочный текст вправо, чтобы вложенный вывод читался.
+func indent(s string) string {
+	out := ""
+	for _, line := range splitLines(s) {
+		out += "    " + line + "\n"
+	}
+	return out[:len(out)-1]
+}
+
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := range len(s) {
+		if s[i] == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	return append(lines, s[start:])
+}
+
+// Сценарий 9. Общий дедлайн через родительский контекст: комбинаторы не имеют
 // собственных опций таймаута — и не нуждаются в них, потому что таймаут
 // это просто свойство ctx, который вы передаёте.
 func demoTimeout() {
@@ -203,7 +358,7 @@ func demoTimeout() {
 	}
 }
 
-// Сценарий 7. Паники: задача может запаниковать, но процесс не упадёт —
+// Сценарий 10. Паники: задача может запаниковать, но процесс не упадёт —
 // паника приедет в Result.Err как *settle.PanicError. А если паниковали
 // ошибкой (идиома panic(err)), то через Unwrap до неё доберётся errors.Is.
 func demoPanic() {
