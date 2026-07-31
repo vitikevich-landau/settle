@@ -87,11 +87,6 @@ func Ordered[T any](seq iter.Seq2[int, Result[T]]) iter.Seq2[int, Result[T]] {
 // общем случае не совпадает с индексом задачи. Когда важна именно позиция,
 // используйте [AllSettled] или обход [Ordered].
 func Values[T any](seq iter.Seq2[int, Result[T]]) ([]T, error) {
-	type failure struct {
-		idx int
-		err error
-	}
-
 	var (
 		ok       []Indexed[T]
 		failures []failure
@@ -110,16 +105,28 @@ func Values[T any](seq iter.Seq2[int, Result[T]]) ([]T, error) {
 		values[i] = r.Value
 	}
 
-	if len(failures) == 0 {
-		return values, nil
-	}
+	return values, joinFailures(failures)
+}
 
+// failure — неудача вместе с индексом своей задачи.
+type failure struct {
+	idx int
+	err error
+}
+
+// joinFailures упорядочивает неудачи по индексам задач и складывает их в одну
+// ошибку. Порядок по индексам, а не по времени завершения, делает и текст
+// ошибки, и обход Unwrap() []error воспроизводимыми от запуска к запуску.
+func joinFailures(failures []failure) error {
+	if len(failures) == 0 {
+		return nil
+	}
 	slices.SortFunc(failures, func(a, b failure) int { return a.idx - b.idx })
 	errs := make([]error, len(failures))
 	for i, f := range failures {
 		errs[i] = fmt.Errorf("settle: task %d: %w", f.idx, f.err)
 	}
-	return values, errors.Join(errs...)
+	return errors.Join(errs...)
 }
 
 // Errors обходит последовательность до конца и собирает только ошибки —
@@ -130,9 +137,18 @@ func Values[T any](seq iter.Seq2[int, Result[T]]) ([]T, error) {
 // Это форма для задач-эффектов: разослать уведомления, инвалидировать кеши,
 // прогреть реплики — там, где возвращаемое значение не несёт смысла, а важен
 // только список того, что не получилось.
+//
+// Значения не удерживаются в памяти даже временно: на потоке в миллион
+// успешных задач — а [Map] рассчитан именно на такие — сбор через [Values] с
+// последующим выбрасыванием среза стоил бы O(число успехов × размер значения).
 func Errors[T any](seq iter.Seq2[int, Result[T]]) error {
-	_, err := Values(seq)
-	return err
+	var failures []failure
+	for i, r := range seq {
+		if r.Err != nil {
+			failures = append(failures, failure{idx: i, err: r.Err})
+		}
+	}
+	return joinFailures(failures)
 }
 
 // Batch собирает последовательность результатов в пачки по n штук, сохраняя

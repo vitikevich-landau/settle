@@ -7,7 +7,9 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // pairs — синтетический источник пар (индекс, Result): трансформеры не должны
@@ -265,4 +267,44 @@ func TestBatchPanicsOnNonPositiveSize(t *testing.T) {
 		}
 	}()
 	Batch(pairs(ok(0, 1)), 0)
+}
+
+// Errors не должен удерживать значения успешных задач: на успех-ориентированном
+// потоке это была бы память, которую функция тут же выбрасывает. Проверяем
+// поведенчески — значение освобождается сразу после обработки.
+func TestErrorsDoesNotRetainValues(t *testing.T) {
+	errBroken := errors.New("broken")
+
+	var live atomic.Int64
+	type payload struct{ data []byte }
+
+	src := func(yield func(int, Result[*payload]) bool) {
+		for i := range 200 {
+			p := &payload{data: make([]byte, 1024)}
+			live.Add(1)
+			runtime.SetFinalizer(p, func(*payload) { live.Add(-1) })
+
+			r := Result[*payload]{Value: p}
+			if i%50 == 49 {
+				r = Result[*payload]{Err: errBroken}
+			}
+			if !yield(i, r) {
+				return
+			}
+		}
+	}
+
+	err := Errors(iter.Seq2[int, Result[*payload]](src))
+	if !errors.Is(err, errBroken) {
+		t.Fatalf("want broken, got %v", err)
+	}
+
+	// Ни одна ссылка не должна пережить обход: значения нигде не накапливались.
+	for range 3 {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := live.Load(); got > 20 {
+		t.Errorf("Errors удерживает значения: живых объектов %d из 200", got)
+	}
 }

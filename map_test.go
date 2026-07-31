@@ -457,3 +457,102 @@ func TestFromChannelPrefersCancellationOverBufferedValue(t *testing.T) {
 		}
 	}
 }
+
+// Слот занимается до того, как элемент запрашивают у входа. Иначе диспетчер
+// изымал бы элемент и ждал бы с ним слот, а отмена в этот момент выбрасывала
+// бы уже изъятую работу: из очереди она пропала, а задача по ней не
+// запускалась. Проверяем на канале — там «изъят» означает буквально «потерян».
+func TestMapDoesNotDiscardPrefetchedWork(t *testing.T) {
+	base := runtime.NumGoroutine()
+	const limit = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	jobs := make(chan int, 10)
+	for i := range 10 {
+		jobs <- i
+	}
+
+	occupied := make(chan struct{})
+	release := make(chan struct{})
+	var handled atomic.Int64
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range Map(ctx, FromChannel(ctx, jobs), limit,
+			func(ctx context.Context, v int) (int, error) {
+				if handled.Add(1) == 1 {
+					// Первая задача занимает единственный слот и держит его,
+					// пока тест не отменит контекст.
+					close(occupied)
+					<-release
+				}
+				return v, nil
+			}) {
+		}
+	}()
+
+	<-occupied
+	// Слот занят: диспетчер сейчас ждёт следующий свободный. Убедимся, что при
+	// этом он не держит в руках изъятый из канала элемент.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	close(release)
+	<-done
+
+	// Обработана ровно одна задача; всё остальное обязано остаться в очереди,
+	// чтобы это подхватил кто-то другой.
+	inQueue := len(jobs)
+	if got := handled.Load(); int(got)+inQueue != 10 {
+		t.Fatalf("работа потеряна: обработано %d, осталось в очереди %d из 10", got, inQueue)
+	}
+	waitNoExtraGoroutines(t, base)
+}
+
+// Отменённый контекст ещё не означает, что результаты некому забрать. При
+// общем дедлайне пачки потребитель продолжает читать, и исходы задач, которые
+// дедлайн застал в работе, обязаны до него доехать — иначе «ровно один Result
+// на прочитанный элемент» превращается в лотерею.
+func TestMapDeliversResultsOfTasksCaughtByDeadline(t *testing.T) {
+	base := runtime.NumGoroutine()
+	const limit = 4
+
+	items := make([]int, 100)
+	for i := range items {
+		items[i] = i
+	}
+
+	for range 20 {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		var started, delivered atomic.Int64
+		for _, r := range Map(ctx, slices.Values(items), limit,
+			func(ctx context.Context, v int) (int, error) {
+				// Как только все слоты заполнены — отменяем: следующие задачи
+				// уже не стартуют, а эти обязаны доложить о себе.
+				if started.Add(1) == limit {
+					cancel()
+				}
+				<-ctx.Done()
+				return 0, ctx.Err()
+			}) {
+			if r.Err == nil {
+				t.Fatal("want a cancellation error")
+			}
+			delivered.Add(1)
+		}
+		cancel()
+
+		// Все стартовавшие задачи доложили о себе, ни один результат не
+		// потерян по дороге.
+		if s, d := started.Load(), delivered.Load(); s != d {
+			t.Fatalf("потеряны результаты: запущено %d, доставлено %d", s, d)
+		}
+		if got := started.Load(); got < limit {
+			t.Fatalf("want at least %d started tasks, got %d", limit, got)
+		}
+	}
+	waitNoExtraGoroutines(t, base)
+}

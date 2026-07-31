@@ -294,3 +294,41 @@ func TestRetryPreservesPartialValue(t *testing.T) {
 		}
 	})
 }
+
+// Одну политику разделяют все задачи пачки, поэтому её последовательность
+// задержек обходится конкурентно. Нормализация frac внутри замыкания была бы
+// записью в общую переменную — гонкой, которую ловит -race.
+func TestJitterPolicyIsSafeForConcurrentUse(t *testing.T) {
+	base := runtime.NumGoroutine()
+	errTemporary := errors.New("temporary")
+
+	// frac > 1 — именно тот случай, который требует нормализации.
+	policy := RetryPolicy{Backoff: Jitter(Constant(time.Millisecond, 3), 5)}
+
+	items := make([]int, 32)
+	for i := range items {
+		items[i] = i
+	}
+
+	for _, r := range Map(context.Background(), slices.Values(items), 8,
+		func(ctx context.Context, v int) (int, error) {
+			return Retry(policy, func(context.Context) (int, error) {
+				return 0, errTemporary
+			})(ctx)
+		}) {
+		if !errors.Is(r.Err, errTemporary) {
+			t.Fatalf("want temporary, got %v", r.Err)
+		}
+	}
+	waitNoExtraGoroutines(t, base)
+}
+
+// frac > 1 обрезается до 1, иначе задержка могла бы стать отрицательной.
+func TestJitterClampsFraction(t *testing.T) {
+	const base = 100 * time.Millisecond
+	for d := range Jitter(Constant(base, 500), 42) {
+		if d < 0 || d > 2*base {
+			t.Fatalf("delay %s out of [0, 200ms]", d)
+		}
+	}
+}

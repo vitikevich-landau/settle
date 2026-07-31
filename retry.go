@@ -183,6 +183,15 @@ func Cap(seq iter.Seq[time.Duration], max time.Duration) iter.Seq[time.Duration]
 // frac ≤ 0 оставляет последовательность нетронутой, frac ≥ 1 обрезается до 1,
 // чтобы задержка не стала отрицательной.
 func Jitter(seq iter.Seq[time.Duration], frac float64) iter.Seq[time.Duration] {
+	// Нормализуем ДО создания замыкания. Внутри это была бы запись в
+	// захваченную переменную, а последовательность рассчитана на то, что её
+	// обходят конкурентно: одну политику разделяют все задачи пачки. Тогда
+	// параллельные обходы писали бы и читали один и тот же frac — гонка,
+	// пусть даже записывается всегда одно и то же значение.
+	if frac > 1 {
+		frac = 1
+	}
+
 	return func(yield func(time.Duration) bool) {
 		if frac <= 0 {
 			for d := range seq {
@@ -191,9 +200,6 @@ func Jitter(seq iter.Seq[time.Duration], frac float64) iter.Seq[time.Duration] {
 				}
 			}
 			return
-		}
-		if frac > 1 {
-			frac = 1
 		}
 		for d := range seq {
 			// rand.Float64 из math/rand/v2 безопасен для конкурентного
